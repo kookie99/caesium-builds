@@ -12,9 +12,9 @@ Open [Build Caesium Windows x64](https://github.com/kookie99/caesium-builds/acti
 | build_mode | `upstream` | Choose `security-patched` for compatible npm security remediation |
 | node_version | `26.13.1` | Tested exact version; select `26.x` or a newer exact version if necessary |
 | rust_version | `1.100.0` | Tested exact version; `stable` selects newest stable |
-| rust_audit_policy | `report` | `block` refuses to build with reported RustSec vulnerabilities |
+| rust_audit_policy | `block` | `report` permits builds with disclosed RustSec findings for investigation only |
 
-For personal use, select `security-patched`, then choose `block` for RustSec if you want the strictest policy. Report mode is useful for investigating Rust advisories, including crates for platforms other than Windows; do not treat a report-mode success with findings as security approval. Review all audit reports before installation.
+For personal use, select `security-patched` and keep the default RustSec policy `block`. For workflow validation against a known vulnerable upstream revision, explicitly choose `report`. Report mode is useful for investigating advisories, including crates for platforms other than Windows; do not treat a report-mode success with findings as security approval. Review all audit reports before installation.
 
 The default exact toolchain versions match the successful November 25, 2026 build, not a claim that they are always the latest. MSVC, NASM and runner images can still change. New upstream requirements may require adjusting the toolchain inputs.
 
@@ -24,13 +24,13 @@ The default exact toolchain versions match the successful November 25, 2026 buil
 - Uses SHA-pinned official GitHub Actions and read-only build permissions; checkout credentials are not persisted.
 - Audits the upstream npm lockfile and installed tree, both full and production-only.
 - In patched mode, runs `npm audit fix --package-lock-only --ignore-scripts --no-force`, preserves upstream manifests and Rust lockfile, records the effective lockfile and patch, and blocks the installer if any npm findings remain. Upstream mode preserves the original lockfile and reports findings.
-- Audits the entire Cargo.lock using pinned cargo-audit 0.23.0 and the current RustSec database. No automatic Rust dependency changes. An invalid or unavailable audit fails either mode; known vulnerabilities block when the Rust policy is `block`. Informational warnings are recorded.
+- Audits the entire Cargo.lock using the official precompiled Windows x64 cargo-audit 0.23.0 release, with a pinned archive SHA-256 and version check. Fetches the current RustSec database; records its revision and rejects unexpected advisory exclusions. No automatic Rust dependency changes. An invalid or unavailable audit fails either mode; known vulnerabilities block when the Rust policy is `block`. Informational warnings are recorded.
 - Generates an npm CycloneDX inventory and Windows-filtered Cargo metadata. These are dependency inventories, not a complete SBOM of the final executable.
 - Runs TypeScript checks, an optimized Windows x64 Tauri/NSIS build and upstream Rust library regression tests. The tests include file collision and atomic output behavior in the current upstream revision.
-- Checks dependency hashes again after compilation and tests and rejects unexpected tracked source changes.
+- Checks dependency hashes again after compilation and tests, rejects unexpected tracked source changes, and confirms the standalone executable did not change during regression testing.
 - Extracts the NSIS installer without executing it, checks the AMD64 PE header, and verifies the embedded executable against the compiled binary. Tauri temporarily replaces its first `__TAURI_BUNDLE_TYPE_VAR_UNK` marker with `__TAURI_BUNDLE_TYPE_VAR_NSS` during NSIS bundling and restores the standalone binary afterward. Only an exact match or the exact documented marker substitution is accepted; any other change blocks publication. The installed-executable hash is calculated from the embedded payload.
-- Publishes a structured manifest, installer SHA-256 and the installed-executable SHA-256.
-- Downloads the exact installer artifact in an independent Linux job, checks its hashes and recorded build identity, and creates GitHub artifact attestations for the installer and manifest. The attestation job has scoped OIDC/attestation permissions, does not check out upstream code, and never executes the installer.
+- Publishes a versioned structured manifest, installer SHA-256, actual embedded-executable SHA-256, and checksums for every accompanying report and supporting file.
+- Downloads the exact installer artifact in an independent Linux job, checks installer and supporting file hashes, source/build identity, audit policies, and report consistency, and creates GitHub artifact attestations for the installer and manifest. The attestation job has scoped OIDC/attestation permissions, does not check out upstream code, and never executes the installer.
 
 The build is not an official release or Authenticode-signed installer. GitHub attestations establish provenance for this repository's build, not approval by the upstream author. A clean audit is not proof of absence of vulnerabilities. Native libraries, npm lifecycle scripts, runtime behavior and all bundled code are not exhaustively security-tested. TypeScript and Rust checks do not substitute for testing the GUI or representative image compression.
 
@@ -43,11 +43,11 @@ Installer archive:
 - `SHA256SUMS.txt`
 - `INSTALLED-EXE-SHA256.txt`
 - `build-manifest.json`
-- Final npm audits, dependency hashes, source record and upstream license
+- Final npm audits, RustSec audit and status, payload verification report, dependency hashes, source record and upstream license
 
 Diagnostics archive:
 - Original/effective npm lockfiles, Rust lockfile and patch in patched mode
-- All npm and RustSec reports, audit status, dependency inventories
+- All npm and RustSec reports, scanner download verification, advisory database revision, audit status, dependency inventories
 - Runner/toolchain information and source identity
 - Compiler, regression test and installer extraction logs, plus payload comparison details and both executable hashes
 
@@ -64,7 +64,7 @@ $M = Get-Content .\build-manifest.json -Raw | ConvertFrom-Json; $I = Join-Path (
 Optional stronger provenance verification, if GitHub CLI is installed:
 
 ```powershell
-gh attestation verify "$I" --repo kookie99/caesium-builds; if ($LASTEXITCODE -ne 0) { throw 'Installer attestation verification failed' }; gh attestation verify .\build-manifest.json --repo kookie99/caesium-builds; if ($LASTEXITCODE -ne 0) { throw 'Manifest attestation verification failed' }
+gh attestation verify "$I" --repo kookie99/caesium-builds --signer-workflow kookie99/caesium-builds/.github/workflows/build-windows.yml --deny-self-hosted-runners; if ($LASTEXITCODE -ne 0) { throw 'Installer attestation verification failed' }; gh attestation verify .\build-manifest.json --repo kookie99/caesium-builds --signer-workflow kookie99/caesium-builds/.github/workflows/build-windows.yml --deny-self-hosted-runners; if ($LASTEXITCODE -ne 0) { throw 'Manifest attestation verification failed' }
 ```
 
 Close Caesium, back up the active settings.json privately, and install over the existing version when appropriate. Then compare the installed executable to the manifest (default per-user install directory):
@@ -77,7 +77,7 @@ Confirm settings remain intact and test a few disposable copies of JPEG, PNG, We
 
 ## Maintenance
 
-- [Workflow validation](https://github.com/kookie99/caesium-builds/actions/workflows/validate-workflows.yml) runs actionlint when workflow files change, or manually.
+- [Workflow validation](https://github.com/kookie99/caesium-builds/actions/workflows/validate-workflows.yml) runs actionlint, payload unit tests on Windows and Linux, manifest acceptance/tamper tests against the exact production verification code, and the shared RustSec scanner on a pinned upstream lockfile. When the prior known-good build artifact is still retained, trusted main-branch pushes also exercise actual NSIS extraction and marker verification on it. The historical fixture is skipped after artifact expiration. These checks do not replace a full build and attestation run.
 - Dependabot checks action pins weekly and proposes pull requests; review changes before merging. It does not automatically update the upstream application's dependencies.
 - The main build remains manually triggered. No recurring builds are scheduled.
 - The exact source commit, manifests, dependency lockfiles and toolchain records improve traceability; bit-for-bit reproducibility is not guaranteed because runner images, registry state, build tools and advisories can change.
