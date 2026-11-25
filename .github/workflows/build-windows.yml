@@ -563,7 +563,7 @@ jobs:
               assert remediation["effective_sha256"] == remediation["upstream_sha256"]
           else:
               assert not any(x["advisory"]["id"] in ("RUSTSEC-2026-0592", "RUSTSEC-2026-0594") for x in rust["vulnerabilities"]["list"])
-              approved = {("cookie", "0.18.2", "0.18.3", "RUSTSEC-2026-0594"), ("url", "2.5.8", "2.5.9", "RUSTSEC-2026-0592")}
+              approved = {("cookie", "0.18.2", "0.18.3", "RUSTSEC-2026-0594"), ("url", "2.5.8", "2.5.9", "RUSTSEC-2026-0592"), ("form_urlencoded", "1.2.2", "1.2.3", "RUSTSEC-2026-0592")}
               assert all((x["name"], x["from"], x["to"], x["advisory"]) in approved for x in remediation["changes"])
           assert data["executable"]["embedded_hash_verified"] is True
           assert data["executable"]["sha256"] == data["executable"]["expected_embedded_sha256"]
