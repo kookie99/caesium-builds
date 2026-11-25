@@ -39,8 +39,12 @@ def load(data):
 def planned(packages, mode):
     if mode == "upstream":
         return []
-    return [(name, old, new, advisory) for name, (old, new, advisory) in TARGETS.items()
-            if (name, old, REGISTRY) in packages]
+    changes = [(name, old, new, advisory) for name, (old, new, advisory) in TARGETS.items()
+               if (name, old, REGISTRY) in packages]
+    if ("url", "2.5.8", REGISTRY) in packages and ("form_urlencoded", "1.2.2", REGISTRY) in packages:
+        # url 2.5.9 explicitly requires form_urlencoded >=1.2.3.
+        changes.append(("form_urlencoded", "1.2.2", "1.2.3", "RUSTSEC-2026-0592"))
+    return changes
 
 
 def verify(before, after, mode):
@@ -77,6 +81,33 @@ def verify(before, after, mode):
             "unrelated_package_changes": 0}
 
 
+def preserve_reviewed_resolver_edge(before, resolved):
+    """Restore the one observed unrelated Cargo resolver edge; reject all other drift."""
+    _, old = load(before)
+    _, new = load(resolved)
+    key = ("cssparser-macros", "0.7.1", REGISTRY)
+    if key not in old or key not in new or old[key] == new[key]:
+        return resolved, False
+    expected = dict(old[key])
+    if expected.get("dependencies") != ["quote", "syn 3.0.9"]:
+        return resolved, False
+    expected["dependencies"] = ["quote", "syn 2.0.119"]
+    if new[key] != expected:
+        return resolved, False
+    # Limit the restoration to the exact package table and one exact dependency.
+    parts = resolved.split(b"[[package]]")
+    matches = 0
+    for index in range(1, len(parts)):
+        block = parts[index]
+        if (b'\nname = "cssparser-macros"\n' in block and
+                b'\nversion = "0.7.1"\n' in block and
+                b'\n "syn 2.0.119",\n' in block):
+            parts[index] = block.replace(b'\n "syn 2.0.119",\n', b'\n "syn 3.0.9",\n', 1)
+            matches += 1
+    require(matches == 1, "Unable to restore the exact reviewed resolver edge")
+    return b"[[package]]".join(parts), True
+
+
 def patch(root, out, mode):
     root, out = root.resolve(), out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -86,14 +117,28 @@ def patch(root, out, mode):
     _, packages = load(before)
     with (out / "cargo-update.log").open("w", encoding="utf-8") as log:
         for name, old, new, advisory in planned(packages, mode):
+            # The URL update resolves its required transitive dependency itself.
+            if name == "form_urlencoded":
+                continue
             args = ["cargo", "update", "--package", f"{name}@{old}", "--precise", new]
             print(" ".join(args), flush=True)
             log.write(" ".join(args) + "\n")
             log.flush()
             subprocess.run(args, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
-    after = lock.read_bytes()
+    resolved = lock.read_bytes()
+    (out / "Cargo.lock.resolved").write_bytes(resolved)
+    after, restored = preserve_reviewed_resolver_edge(before, resolved) if mode == "security-patched" else (resolved, False)
     (out / "Cargo.lock.effective").write_bytes(after)
     report = verify(before, after, mode)
+    if restored:
+        lock.write_bytes(after)
+    report["restored_unrelated_resolver_edge"] = restored
+    # Ask Cargo itself to accept the precise lockfile without any further changes.
+    with (out / "cargo-locked-validation.json").open("wb") as log, (out / "cargo-locked-validation-stderr.log").open("wb") as err:
+        subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1",
+                        "--filter-platform", "x86_64-pc-windows-msvc"],
+                       cwd=root, stdout=log, stderr=err, check=True)
+    require(lock.read_bytes() == after, "Cargo changed the validated lockfile")
     (out / "rust-remediation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     with (out / "cargo-lockfile-changes.patch").open("wb") as log:
         subprocess.run(["git", "diff", "--binary", "HEAD", "--", "Cargo.lock"],
@@ -114,6 +159,29 @@ def fixture(cookie="0.18.2", url="2.5.8", other="1.0.0", extra=""):
 
 
 class PatchTests(unittest.TestCase):
+    def test_required_transitive_update(self):
+        extra = lambda version, checksum: f'\n[[package]]\nname = "form_urlencoded"\nversion = "{version}"\nsource = "{REGISTRY}"\nchecksum = "{checksum * 64}"\n'
+        before = fixture(extra=extra("1.2.2", "a"))
+        after = fixture("0.18.3", "2.5.9", extra=extra("1.2.3", "b"))
+        self.assertEqual(len(verify(before, after, "security-patched")["changes"]), 3)
+        with self.assertRaises(ValueError):
+            verify(before, fixture("0.18.3", "2.5.9", extra=extra("1.2.4", "b")), "security-patched")
+
+    def test_restore_only_known_edge(self):
+        extra = f'\n[[package]]\nname = "cssparser-macros"\nversion = "0.7.1"\nsource = "{REGISTRY}"\nchecksum = "{"f" * 64}"\ndependencies = [\n "quote",\n "syn 3.0.9",\n]\n'
+        before = fixture(extra=extra)
+        expected = fixture("0.18.3", "2.5.9", extra=extra)
+        resolved = expected.replace(b'syn 3.0.9', b'syn 2.0.119')
+        repaired, restored = preserve_reviewed_resolver_edge(before, resolved)
+        self.assertTrue(restored)
+        self.assertEqual(repaired, expected)
+        verify(before, repaired, "security-patched")
+        other = resolved.replace(b'"quote"', b'"other"')
+        repaired, restored = preserve_reviewed_resolver_edge(before, other)
+        self.assertFalse(restored)
+        with self.assertRaises(ValueError):
+            verify(before, repaired, "security-patched")
+
     def test_two_patches(self):
         self.assertEqual(len(verify(fixture(), fixture("0.18.3", "2.5.9"), "security-patched")["changes"]), 2)
 
