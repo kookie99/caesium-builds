@@ -33,15 +33,22 @@ class ManifestTests(unittest.TestCase):
         self.exe = self.root / "Caesium-fixture-setup.exe"
         self.exe.write_bytes(b"not executable; never executed by manifest verifier")
         self.manifest = self.root / "build-manifest.json"
-        self.rust_status = {"policy": "report", "vulnerabilities": 2,
-                            "informational_warnings": 6, "exit_code": 1}
+        self.rust_status = {"policy": "report", "vulnerabilities": 0,
+                            "informational_warnings": 6, "exit_code": 0}
         self.payload = {
             "compiled_sha256": "1" * 64, "embedded_sha256": "2" * 64,
             "expected_embedded_sha256": "2" * 64, "comparison": "tauri-nsis-marker",
             "marker_offset": 300, "compiled_size": 512, "embedded_size": 512,
         }
         self.jsonfile("cargo-audit-status.json", self.rust_status)
-        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 2}})
+        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 0, "list": []}})
+        (self.root / "Cargo.lock.upstream").write_text("original fixture lock")
+        (self.root / "Cargo.lock.effective").write_text("patched fixture lock")
+        self.remediation = {"mode": "security-patched", "unrelated_package_changes": 0,
+                            "upstream_sha256": digest(self.root / "Cargo.lock.upstream"),
+                            "effective_sha256": digest(self.root / "Cargo.lock.effective"),
+                            "changes": [{"name": "url", "from": "2.5.8", "to": "2.5.9", "advisory": "RUSTSEC-2026-0592"}]}
+        self.jsonfile("rust-remediation.json", self.remediation)
         self.jsonfile("installer-payload-verification.json", self.payload)
         for label in ("full", "production"):
             self.jsonfile(f"npm-audit-final-{label}.json",
@@ -50,7 +57,7 @@ class ManifestTests(unittest.TestCase):
                      "UPSTREAM-LICENSE.md", "source.txt", "effective-lockfile-hashes.json"):
             (self.root / name).write_text("fixture", encoding="utf-8")
         self.data = {
-            "schema_version": 2, "app_version": "3.0.0-alpha.2",
+            "schema_version": 3, "app_version": "3.0.0-alpha.2",
             "source_repository": "Lymphatus/caesium-v3", "source_commit": "a" * 40,
             "workflow_commit": "b" * 40, "run_id": "123", "run_attempt": "1",
             "build_mode": "security-patched", "target": "x86_64-pc-windows-msvc",
@@ -66,6 +73,7 @@ class ManifestTests(unittest.TestCase):
                            "embedded_hash_verified": True},
             "npm_full_findings": 0, "npm_production_findings": 0,
             "rust_audit": copy.deepcopy(self.rust_status),
+            "dependency_files": [{"name": "Cargo.lock", "sha256": self.remediation["effective_sha256"]}],
             "rust_tests": "passed", "signed_by_upstream": False,
         }
         self.env = os.environ.copy()
@@ -104,7 +112,7 @@ class ManifestTests(unittest.TestCase):
         self.run_case(False)
 
     def test_tampered_audit_report(self):
-        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 0}})
+        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 99}})
         self.run_case(False)
 
     def test_missing_supporting_file(self):
@@ -131,10 +139,25 @@ class ManifestTests(unittest.TestCase):
         self.run_case(False)
 
     def test_rust_block_findings(self):
-        self.rust_status["policy"] = "block"
+        self.rust_status.update(policy="block", vulnerabilities=1, exit_code=1)
+        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 1, "list": [{"advisory": {"id": "RUSTSEC-TEST-OTHER"}}]}})
         self.data["rust_audit"] = copy.deepcopy(self.rust_status)
         self.env["EXPECTED_RUST_POLICY"] = "block"
         self.jsonfile("cargo-audit-status.json", self.rust_status)
+        self.refresh_manifest()
+        self.run_case(False)
+
+    def test_reviewed_rust_vulnerability_remains(self):
+        self.rust_status.update(vulnerabilities=1, exit_code=1)
+        self.data["rust_audit"] = copy.deepcopy(self.rust_status)
+        self.jsonfile("cargo-audit-status.json", self.rust_status)
+        self.jsonfile("cargo-audit.json", {"vulnerabilities": {"count": 1, "list": [{"advisory": {"id": "RUSTSEC-2026-0592"}}]}})
+        self.refresh_manifest()
+        self.run_case(False)
+
+    def test_unapproved_rust_patch(self):
+        self.remediation["changes"][0]["to"] = "3.0.0"
+        self.jsonfile("rust-remediation.json", self.remediation)
         self.refresh_manifest()
         self.run_case(False)
 
@@ -146,6 +169,10 @@ class ManifestTests(unittest.TestCase):
     def test_upstream_findings_reported(self):
         self.data["build_mode"] = "upstream"
         self.env["EXPECTED_MODE"] = "upstream"
+        (self.root / "Cargo.lock.effective").write_bytes((self.root / "Cargo.lock.upstream").read_bytes())
+        self.remediation.update(mode="upstream", changes=[], effective_sha256=self.remediation["upstream_sha256"])
+        self.data["dependency_files"][0]["sha256"] = self.remediation["effective_sha256"]
+        self.jsonfile("rust-remediation.json", self.remediation)
         self.data["npm_full_findings"] = 12
         self.jsonfile("npm-audit-final-full.json",
                       {"metadata": {"vulnerabilities": {"total": 12}}})
