@@ -1,11 +1,13 @@
-name: Validate GitHub workflows
+name: Validate GitHub workflows and build helpers
 on:
   push:
     paths:
       - '.github/workflows/**'
+      - 'scripts/**'
   pull_request:
     paths:
       - '.github/workflows/**'
+      - 'scripts/**'
   workflow_dispatch:
 permissions:
   contents: read
@@ -23,3 +25,35 @@ jobs:
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           "$GOBIN/actionlint" -color
+      - name: Test verifier on Linux
+        run: python scripts/verify_payload.py --self-test
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test verifier on Windows
+        shell: pwsh
+        run: |
+          python scripts/verify_payload.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Verifier tests failed' }
+      - name: Exercise verified RustSec binary download and CLI
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'audit-preflight'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          $zip = Join-Path $root 'cargo-audit.zip'
+          Invoke-WebRequest -Uri 'https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-pc-windows-msvc-v0.23.0.zip' -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 2 -TimeoutSec 120
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne 'aafeb61206730029601a72e669a12231f8674427e6248d02f6cb382cb36d56b4') { throw 'RustSec archive hash mismatch' }
+          Expand-Archive -LiteralPath $zip -DestinationPath "$root/unpacked"
+          $bins = @(Get-ChildItem -LiteralPath "$root/unpacked" -Recurse -File -Filter cargo-audit.exe)
+          if ($bins.Count -ne 1) { throw 'Expected one cargo-audit binary' }
+          $bin = $bins[0].FullName
+          $version = (& $bin --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '0\.23\.0') { throw 'Unexpected scanner version' }
+          Write-Host $version
+          & $bin audit --help
+          if ($LASTEXITCODE -ne 0) { throw 'Scanner audit subcommand failed' }
