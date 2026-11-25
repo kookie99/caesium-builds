@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'Official Caesium branch, tag or full commit SHA (main = newest source)'
+        description: 'Official main, version tag, or full commit SHA reachable from main'
         required: true
         default: main
         type: string
@@ -30,7 +30,7 @@ on:
       rust_audit_policy:
         description: 'Report RustSec findings or block on known Rust vulnerabilities'
         required: true
-        default: report
+        default: block
         type: choice
         options:
           - report
@@ -51,6 +51,8 @@ jobs:
       installer_id: ${{ steps.upload.outputs.artifact-id }}
       installer_sha: ${{ steps.stage.outputs.installer_sha }}
       manifest_sha: ${{ steps.stage.outputs.manifest_sha }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      producer_attempt: ${{ steps.stage.outputs.producer_attempt }}
     defaults:
       run:
         shell: pwsh
@@ -75,6 +77,19 @@ jobs:
           $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
           New-Item -ItemType Directory -Path $out -Force | Out-Null
           [ordered]@{source_ref=$env:SOURCE_REF;build_mode=$env:BUILD_MODE;node_requested=$env:NODE_REQUESTED;rust_requested=$env:RUST_REQUESTED;rust_audit_policy=$env:RUST_AUDIT_POLICY;workflow_sha=$env:GITHUB_SHA;runner_os=$env:RUNNER_OS;runner_arch=$env:RUNNER_ARCH;runner_image=$env:ImageOS;runner_image_version=$env:ImageVersion} | ConvertTo-Json | Set-Content "$out/build-inputs.json"
+
+      - name: Check out trusted build helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controls
+          persist-credentials: false
+
+      - name: Test payload verifier before compilation
+        working-directory: ${{ github.workspace }}
+        run: |
+          python controls/scripts/verify_payload.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Payload verifier self-tests failed' }
 
       - name: Check out official source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -168,17 +183,30 @@ jobs:
           New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
           Push-Location $toolRoot
           try {
-            cargo install cargo-audit --version '=0.23.0' --locked --root $toolRoot 2>&1 | Tee-Object "$out/cargo-audit-install.log"
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot install pinned cargo-audit' }
-            $env:Path = "$toolRoot\bin;$env:Path"
-            cargo audit --version | Set-Content "$out/cargo-audit-version.txt"
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot run cargo-audit' }
+            # Official RustSec release asset; digest recorded from GitHub release metadata.
+            $url = 'https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-pc-windows-msvc-v0.23.0.zip'
+            $expectedDigest = 'aafeb61206730029601a72e669a12231f8674427e6248d02f6cb382cb36d56b4'
+            $archive = Join-Path $toolRoot 'cargo-audit.zip'
+            Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 2 -TimeoutSec 120
+            $actualDigest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            [ordered]@{url=$url;expected_sha256=$expectedDigest;actual_sha256=$actualDigest} | ConvertTo-Json | Set-Content "$out/cargo-audit-download.json"
+            if ($actualDigest -ne $expectedDigest) { throw 'RustSec tool download hash mismatch' }
+            Expand-Archive -LiteralPath $archive -DestinationPath "$toolRoot/extracted"
+            $tools = @(Get-ChildItem -LiteralPath "$toolRoot/extracted" -Recurse -File -Filter 'cargo-audit.exe')
+            if ($tools.Count -ne 1) { throw 'Expected exactly one cargo-audit executable' }
+            $audit = $tools[0].FullName
+            $actualVersion = (& $audit --version | Out-String).Trim()
+            $actualVersion | Set-Content "$out/cargo-audit-version.txt"
+            if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch '(?<![0-9.])0\.23\.0(?![0-9.])') { throw 'Unexpected cargo-audit version' }
             $lock = Join-Path $env:GITHUB_WORKSPACE 'upstream/Cargo.lock'
-            cargo audit --json --file $lock 1> "$out/cargo-audit.json" 2> "$out/cargo-audit-stderr.log"
+            & $audit audit --json --file $lock 1> "$out/cargo-audit.json" 2> "$out/cargo-audit-stderr.log"
             $code = $LASTEXITCODE
             $report = Get-Content "$out/cargo-audit.json" -Raw | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $report.vulnerabilities.count -or $null -eq $report.vulnerabilities.found -or $code -notin @(0,1)) { throw 'RustSec audit unavailable or invalid' }
+            if ($report.database.'last-commit' -notmatch '^[0-9a-f]{40}$' -or !$report.database.'last-updated') { throw 'RustSec advisory database identity missing' }
+            if (@($report.settings.ignore).Count -gt 0 -or @($report.settings.target_os).Count -gt 0 -or @($report.settings.target_arch).Count -gt 0) { throw 'Unexpected RustSec advisory exclusions' }
             $count = [int]$report.vulnerabilities.count
+            if ($count -ne @($report.vulnerabilities.list).Count) { throw 'RustSec advisory count mismatch' }
             if (($count -gt 0) -ne [bool]$report.vulnerabilities.found -or ($count -gt 0 -and $code -ne 1) -or ($count -eq 0 -and $code -ne 0)) { throw 'RustSec audit status inconsistent' }
             $warnings = 0
             if ($report.warnings) { foreach ($p in $report.warnings.PSObject.Properties) { if ($p.Value -is [array]) { $warnings += $p.Value.Count } } }
@@ -365,7 +393,7 @@ jobs:
           cargo test --locked --release --workspace --lib --target x86_64-pc-windows-msvc 2>&1 | Tee-Object "$out/rust-tests.log"
           if ($LASTEXITCODE -ne 0) { throw 'Rust regression tests failed' }
           $results = Select-String -Path "$out/rust-tests.log" -Pattern 'test result:'
-          if (!$results) { throw 'No Rust test summary found' }
+          if (!$results -or -not ($results.Line -match 'test result: ok\. [1-9][0-9]* passed; 0 failed;')) { throw 'No nonempty successful Rust test suite found' }
           "### Rust regression tests" | Add-Content $env:GITHUB_STEP_SUMMARY
           $results.Line | ForEach-Object { "- $_" | Add-Content $env:GITHUB_STEP_SUMMARY }
           $expected = Get-Content "$out/effective-lockfile-hashes.json" -Raw | ConvertFrom-Json
@@ -393,19 +421,6 @@ jobs:
           if ($hash -ne (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Installer copy hash mismatch' }
           $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
           $binary = Get-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/Caesium Image Compressor.exe'
-          function Assert-X64PE([string]$Path) {
-            $stream = [IO.File]::OpenRead($Path)
-            $reader = [IO.BinaryReader]::new($stream)
-            try {
-              if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Missing MZ header' }
-              $stream.Position = 0x3C
-              $peOffset = $reader.ReadInt32()
-              if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 6)) { throw 'Invalid PE offset' }
-              $stream.Position = $peOffset
-              if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Not an AMD64 PE executable' }
-            } finally { $reader.Dispose() }
-          }
-          Assert-X64PE $binary.FullName
           $binaryHash = (Get-FileHash -LiteralPath $binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($binaryHash -ne (Get-Content "$out/pre-test-exe-sha256.txt" -Raw).Trim()) { throw 'Compiled executable changed during regression tests' }
           $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
@@ -417,27 +432,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'NSIS extraction failed' }
           $embedded = @(Get-ChildItem -LiteralPath $unpack -Recurse -File | Where-Object Name -eq $binary.Name)
           if ($embedded.Count -ne 1) { throw 'Expected one embedded application executable' }
-          $embeddedHash = (Get-FileHash -LiteralPath $embedded[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          # Tauri restores the unpatched standalone executable after bundling.
-          # Model only its documented first UNK -> NSS bundle marker replacement.
-          $expectedHash = $binaryHash
-          $comparison = 'exact'
-          $markerOffset = $null
-          if ($embeddedHash -ne $binaryHash) {
-            $raw = [IO.File]::ReadAllBytes($binary.FullName)
-            $text = [Text.Encoding]::Latin1.GetString($raw)
-            $old = '__TAURI_BUNDLE_TYPE_VAR_UNK'
-            $new = '__TAURI_BUNDLE_TYPE_VAR_NSS'
-            $markerOffset = $text.IndexOf($old,[StringComparison]::Ordinal)
-            if ($markerOffset -lt 0 -or $old.Length -ne $new.Length) { throw 'Expected Tauri bundle marker not found' }
-            $replacement = [Text.Encoding]::ASCII.GetBytes($new)
-            [Array]::Copy($replacement,0,$raw,$markerOffset,$replacement.Length)
-            $expectedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($raw)).ToLowerInvariant()
-            $comparison = 'tauri-nsis-marker'
+          $verifier = Join-Path $env:GITHUB_WORKSPACE 'controls/scripts/verify_payload.py'
+          python $verifier --compiled $binary.FullName --embedded $embedded[0].FullName 1> "$out/installer-payload-verification.json" 2> "$out/installer-payload-verification-stderr.log"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content "$out/installer-payload-verification-stderr.log" | Write-Host
+            throw 'Installer payload verification failed'
           }
-          [ordered]@{compiled_sha256=$binaryHash;embedded_sha256=$embeddedHash;expected_embedded_sha256=$expectedHash;comparison=$comparison;marker_offset=$markerOffset;compiled_size=$binary.Length;embedded_size=$embedded[0].Length} | ConvertTo-Json | Set-Content "$out/installer-payload-verification.json"
-          if ($embedded[0].Length -ne $binary.Length -or $embeddedHash -ne $expectedHash) { throw 'Embedded executable differs beyond the documented Tauri bundle marker' }
-          Assert-X64PE $embedded[0].FullName
+          $payload = Get-Content "$out/installer-payload-verification.json" -Raw | ConvertFrom-Json
+          if ($payload.compiled_sha256 -ne $binaryHash -or $payload.embedded_sha256 -ne (Get-FileHash -LiteralPath $embedded[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Verifier hash cross-check failed' }
+          $embeddedHash = $payload.embedded_sha256
+          $expectedHash = $payload.expected_embedded_sha256
+          $comparison = $payload.comparison
+          $markerOffset = $payload.marker_offset
           "$hash  $($copy.Name)" | Set-Content "$dest/SHA256SUMS.txt"
           "$embeddedHash  $($binary.Name)" | Set-Content "$dest/INSTALLED-EXE-SHA256.txt"
           $rust = Get-Content "$out/cargo-audit-status.json" -Raw | ConvertFrom-Json
@@ -454,11 +460,12 @@ jobs:
           Copy-Item "$dest/build-manifest.json" "$out/build-manifest.json"
           "installer_sha=$hash" >> $env:GITHUB_OUTPUT
           "manifest_sha=$((Get-FileHash "$dest/build-manifest.json" -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "producer_attempt=$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
           "- Installed executable SHA-256: $embeddedHash (verified: $comparison)" | Add-Content $env:GITHUB_STEP_SUMMARY
           Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
           Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
           Copy-Item "$env:GITHUB_WORKSPACE/build-record/effective-lockfile-hashes.json" "$dest/effective-lockfile-hashes.json"
-          Copy-Item "$env:GITHUB_WORKSPACE/build-record/npm-audit-final-full.json","$env:GITHUB_WORKSPACE/build-record/npm-audit-final-production.json" $dest
+          Copy-Item "$out/npm-audit-final-full.json","$out/npm-audit-final-production.json","$out/cargo-audit.json","$out/cargo-audit-status.json","$out/installer-payload-verification.json" $dest
           "- Build mode: $env:BUILD_MODE" | Add-Content $env:GITHUB_STEP_SUMMARY
           "### Unofficial Caesium Windows x64 build`n- Source: ${{ steps.source.outputs.sha }}`n- Version: ${{ steps.source.outputs.version }}`n- Installer: $($copy.Name)`n- SHA-256: $hash`n- Unsigned; review audit report before installing." | Add-Content $env:GITHUB_STEP_SUMMARY
 
@@ -504,8 +511,11 @@ jobs:
           EXPECTED_INSTALLER_SHA: ${{ needs.build.outputs.installer_sha }}
           EXPECTED_MANIFEST_SHA: ${{ needs.build.outputs.manifest_sha }}
           EXPECTED_MODE: ${{ inputs.build_mode }}
+          EXPECTED_RUST_POLICY: ${{ inputs.rust_audit_policy }}
+          EXPECTED_SOURCE: ${{ needs.build.outputs.source_sha }}
+          EXPECTED_ATTEMPT: ${{ needs.build.outputs.producer_attempt }}
         run: |
-          python - <<'PY'
+          python -B - <<'PY'
           import hashlib, json, os
           from pathlib import Path
           root = Path("verified")
@@ -524,6 +534,24 @@ jobs:
           assert data["workflow_commit"] == os.environ["GITHUB_SHA"]
           assert str(data["run_id"]) == os.environ["GITHUB_RUN_ID"]
           assert data["build_mode"] == os.environ["EXPECTED_MODE"]
+          assert data["rust_audit"]["policy"] == os.environ["EXPECTED_RUST_POLICY"]
+          assert data["source_commit"] == os.environ["EXPECTED_SOURCE"]
+          assert str(data["run_attempt"]) == os.environ["EXPECTED_ATTEMPT"]
+          assert data["schema_version"] == 1
+          assert data["target"] == "x86_64-pc-windows-msvc"
+          assert data["source_repository"] == "Lymphatus/caesium-v3"
+          assert data["rust_tests"] == "passed"
+          assert data["signed_by_upstream"] is False
+          for label, field in (("full", "npm_full_findings"), ("production", "npm_production_findings")):
+              audit = json.loads((manifest.parent / f"npm-audit-final-{label}.json").read_text(encoding="utf-8-sig"))
+              assert "error" not in audit
+              assert audit["metadata"]["vulnerabilities"]["total"] == data[field]
+          rust = json.loads((manifest.parent / "cargo-audit.json").read_text(encoding="utf-8-sig"))
+          assert rust["vulnerabilities"]["count"] == data["rust_audit"]["vulnerabilities"]
+          payload = json.loads((manifest.parent / "installer-payload-verification.json").read_text(encoding="utf-8-sig"))
+          assert payload["embedded_sha256"] == data["executable"]["sha256"]
+          assert payload["compiled_sha256"] == data["executable"]["compiled_sha256"]
+          assert payload["comparison"] == data["executable"]["comparison"]
           assert data["executable"]["embedded_hash_verified"] is True
           assert data["executable"]["sha256"] == data["executable"]["expected_embedded_sha256"]
           assert data["executable"]["comparison"] in ("exact", "tauri-nsis-marker")
