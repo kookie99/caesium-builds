@@ -9,7 +9,7 @@ Open [Build Caesium Windows x64](https://github.com/kookie99/caesium-builds/acti
 | Input | Default | Options / purpose |
 | --- | --- | --- |
 | source_ref | `main` | Official main, a full commit reachable from main, or an official version tag |
-| build_mode | `upstream` | Choose `security-patched` for compatible npm security remediation |
+| build_mode | `upstream` | Choose `security-patched` for reviewed Rust lockfile patches and compatible npm security remediation |
 | node_version | `26.13.1` | Tested exact version; select `26.x` or a newer exact version if necessary |
 | rust_version | `1.100.0` | Tested exact version; `stable` selects newest stable |
 | rust_audit_policy | `block` | `report` permits builds with disclosed RustSec findings for investigation only |
@@ -23,8 +23,8 @@ The default exact toolchain versions match the successful November 25, 2026 buil
 - Restricts source refs to official main history or version tags; records the actual commit, workflow commit, runner image and toolchain.
 - Uses SHA-pinned official GitHub Actions and read-only build permissions; checkout credentials are not persisted.
 - Audits the upstream npm lockfile and installed tree, both full and production-only.
-- In patched mode, runs `npm audit fix --package-lock-only --ignore-scripts --no-force`, preserves upstream manifests and Rust lockfile, records the effective lockfile and patch, and blocks the installer if any npm findings remain. Upstream mode preserves the original lockfile and reports findings.
-- Audits the entire Cargo.lock using the official precompiled Windows x64 cargo-audit 0.23.0 release, with a pinned archive SHA-256 and version check. Fetches the current RustSec database; records its revision and rejects unexpected advisory exclusions. No automatic Rust dependency changes. An invalid or unavailable audit fails either mode; known vulnerabilities block when the Rust policy is `block`. Informational warnings are recorded.
+- In patched mode, runs `npm audit fix --package-lock-only --ignore-scripts --no-force`, preserves upstream dependency manifests, records the effective npm lockfile and patch, and blocks the installer if any npm findings remain. Upstream mode preserves the original lockfile and reports findings.
+- Audits the entire Cargo.lock using the official precompiled Windows x64 cargo-audit 0.23.0 release, with a pinned archive SHA-256 and version check. Fetches the current RustSec database; records its revision and rejects unexpected advisory exclusions. In upstream mode the original Rust lockfile is preserved. In security-patched mode, the reviewed exact versions cookie 0.18.2 → 0.18.3 (RUSTSEC-2026-0594) and url 2.5.8 → 2.5.9 (RUSTSEC-2026-0592) are applied using Cargo's targeted resolver. Any unrelated package, checksum, dependency edge or manifest change blocks the build. Already fixed or newer versions are not downgraded. The reviewed advisories must be absent from the final audit even in report mode. New vulnerabilities require separate review. An invalid or unavailable audit fails either mode; known vulnerabilities block when the Rust policy is `block`. Informational warnings are recorded.
 - Generates an npm CycloneDX inventory and Windows-filtered Cargo metadata. These are dependency inventories, not a complete SBOM of the final executable.
 - Runs TypeScript checks, an optimized Windows x64 Tauri/NSIS build and upstream Rust library regression tests. The tests include file collision and atomic output behavior in the current upstream revision.
 - Checks dependency hashes again after compilation and tests, rejects unexpected tracked source changes, and confirms the standalone executable did not change during regression testing.
@@ -43,10 +43,10 @@ Installer archive:
 - `SHA256SUMS.txt`
 - `INSTALLED-EXE-SHA256.txt`
 - `build-manifest.json`
-- Final npm audits, RustSec audit and status, payload verification report, dependency hashes, source record and upstream license
+- Final npm audits, RustSec audit and status, Rust remediation report, original/effective Rust lockfiles, payload verification report, dependency hashes, source record and upstream license
 
 Diagnostics archive:
-- Original/effective npm lockfiles, Rust lockfile and patch in patched mode
+- Original/effective npm and Rust lockfiles, dependency patches and targeted Cargo update logs
 - All npm and RustSec reports, scanner download verification, advisory database revision, audit status, dependency inventories
 - Runner/toolchain information and source identity
 - Compiler, regression test and installer extraction logs, plus payload comparison details and both executable hashes
@@ -77,11 +77,11 @@ Confirm settings remain intact and test a few disposable copies of JPEG, PNG, We
 
 ## Maintenance
 
-- [Workflow validation](https://github.com/kookie99/caesium-builds/actions/workflows/validate-workflows.yml) runs actionlint, payload unit tests on Windows and Linux, manifest acceptance/tamper tests against the exact production verification code, and the shared RustSec scanner on a pinned upstream lockfile. When the prior known-good build artifact is still retained, trusted main-branch pushes also exercise actual NSIS extraction and marker verification on it. The historical fixture is skipped after artifact expiration. These checks do not replace a full build and attestation run.
+- [Workflow validation](https://github.com/kookie99/caesium-builds/actions/workflows/validate-workflows.yml) runs actionlint, payload unit tests on Windows and Linux, manifest acceptance/tamper tests against the exact production verification code, the targeted Rust remediation tests, and the shared RustSec scanner before and after real Cargo resolution on a pinned upstream revision. When the prior known-good build artifact is still retained, trusted main-branch pushes also exercise actual NSIS extraction and marker verification on it. The historical fixture is skipped after artifact expiration. These checks do not replace a full build and attestation run.
 - Dependabot checks action pins weekly and proposes pull requests; review changes before merging. It does not automatically update the upstream application's dependencies.
 - The main build remains manually triggered. No recurring builds are scheduled.
 - The exact source commit, manifests, dependency lockfiles and toolchain records improve traceability; bit-for-bit reproducibility is not guaranteed because runner images, registry state, build tools and advisories can change.
 
 ## License
 
-Original application: [Lymphatus/caesium-v3](https://github.com/Lymphatus/caesium-v3). The build override disables signed updater-artifact generation, not the upstream updater itself. The optional npm remediation changes only the runner checkout, not the upstream repository.
+Original application: [Lymphatus/caesium-v3](https://github.com/Lymphatus/caesium-v3). The build override disables signed updater-artifact generation, not the upstream updater itself. The optional npm and reviewed Rust remediation change only the runner checkout, not the upstream repository.
