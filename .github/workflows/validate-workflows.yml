@@ -29,10 +29,12 @@ jobs:
         run: python scripts/verify_payload.py --self-test
       - name: Test exact independent manifest verifier with tamper fixtures
         run: python scripts/test_manifest_verifier.py
+      - name: Test targeted Rust lockfile remediation
+        run: python scripts/patch_rust.py --self-test
 
   windows:
     runs-on: windows-2025
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,15 +44,16 @@ jobs:
         run: |
           python scripts/verify_payload.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Verifier tests failed' }
-      - name: Check out known upstream lockfile for audit preflight
+      - name: Test Rust lockfile remediation on Windows
+        shell: pwsh
+        run: python scripts/patch_rust.py --self-test
+      - name: Check out known upstream source for audit and remediation preflight
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Lymphatus/caesium-v3
           ref: c9878771d4f0017068eac71774687ec776d37018
           path: reference-source
           persist-credentials: false
-          sparse-checkout: Cargo.lock
-          sparse-checkout-cone-mode: false
       - name: Run exact production RustSec helper in report mode
         shell: pwsh
         run: |
@@ -58,6 +61,25 @@ jobs:
           $report = Get-Content ./audit-preflight/cargo-audit-status.json -Raw | ConvertFrom-Json
           if ($report.policy -ne 'report' -or $null -eq $report.vulnerabilities) { throw 'Audit preflight produced invalid status' }
           Get-Content ./audit-preflight/cargo-audit-status.json | Write-Host
+          exit 0
+      - name: Resolve the exact two Rust updates without compiling
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.100.0-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          $env:RUSTUP_TOOLCHAIN = '1.100.0-x86_64-pc-windows-msvc'
+          python scripts/patch_rust.py --root reference-source --out audit-preflight/patch --mode security-patched
+          if ($LASTEXITCODE -ne 0) { throw 'Rust patch preflight failed' }
+          $patch = Get-Content audit-preflight/patch/rust-remediation.json -Raw | ConvertFrom-Json
+          if ($patch.changes.Count -ne 2 -or $patch.unrelated_package_changes -ne 0) { throw 'Unexpected reference lockfile change set' }
+          Get-Content audit-preflight/patch/rust-remediation.json | Write-Host
+      - name: Verify patched reference lockfile with strict RustSec policy
+        shell: pwsh
+        run: |
+          & ./scripts/audit_rust.ps1 -LockFile './reference-source/Cargo.lock' -OutputDirectory './audit-preflight/patched-audit' -Policy block
+          $report = Get-Content './audit-preflight/patched-audit/cargo-audit-status.json' -Raw | ConvertFrom-Json
+          if ($report.vulnerabilities -ne 0) { throw 'Reference patch did not clear RustSec findings' }
+          Get-Content './audit-preflight/patched-audit/cargo-audit-status.json' | Write-Host
           exit 0
       - name: Save audit preflight reports
         if: always()
