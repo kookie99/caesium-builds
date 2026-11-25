@@ -8,6 +8,14 @@ on:
         required: true
         default: main
         type: string
+      build_mode:
+        description: 'Upstream lockfile or opt-in npm security remediation'
+        required: true
+        default: upstream
+        type: choice
+        options:
+          - upstream
+          - security-patched
 
 permissions:
   contents: read
@@ -28,6 +36,7 @@ jobs:
       CARGO_TERM_COLOR: never
       NO_COLOR: '1'
       CI: 'true'
+      BUILD_MODE: ${{ inputs.build_mode }}
     steps:
       - name: Check out official source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -54,6 +63,10 @@ jobs:
           "Official source: https://github.com/Lymphatus/caesium-v3/tree/$sha`nCommit: $sha`nVersion: $version`nTarget: x86_64-pc-windows-msvc`nBuild: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | Set-Content "$out/source.txt"
           git log -1 --format=fuller | Add-Content "$out/source.txt"
           Get-FileHash package-lock.json,Cargo.lock -Algorithm SHA256 | Format-List | Out-File "$out/lockfile-hashes.txt"
+          if ($env:BUILD_MODE -notin @('upstream','security-patched')) { throw 'Invalid build mode' }
+          "Build mode: $env:BUILD_MODE" | Add-Content "$out/source.txt"
+          Copy-Item package-lock.json "$out/package-lock.upstream.json"
+          Copy-Item package.json "$out/package.upstream.json"
           Copy-Item LICENSE.md "$out/UPSTREAM-LICENSE.md"
 
       - name: Set up Node.js
@@ -85,21 +98,133 @@ jobs:
             git --version
           } | Tee-Object "$out/toolchain.txt"
 
+      - name: Audit original dependency lockfile
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          function Invoke-DependencyAudit {
+            param([string]$Label, [string[]]$Extra)
+            $auditArgs = @('audit','--json','--audit-level=low') + $Extra
+            & npm.cmd @auditArgs 1> "$out/$Label.json" 2> "$out/$Label-stderr.log"
+            $code = $LASTEXITCODE
+            "npm audit exit code: $code" | Set-Content "$out/$Label-status.txt"
+            $report = Get-Content "$out/$Label.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($report.error -or $null -eq $report.metadata.vulnerabilities.total -or $code -notin @(0,1)) { throw "Audit unavailable or invalid: $Label (exit $code)" }
+            $v = $report.metadata.vulnerabilities
+            $total = [int]$v.total
+            if (($total -gt 0 -and $code -eq 0) -or ($total -eq 0 -and $code -ne 0)) { throw "Inconsistent audit status: $Label" }
+            $line = "| $Label | $($v.info) | $($v.low) | $($v.moderate) | $($v.high) | $($v.critical) | $total |"
+            $line | Add-Content $env:GITHUB_STEP_SUMMARY
+            Write-Host $line
+            return $total
+          }
+          @('### npm dependency audit','| Report | Info | Low | Moderate | High | Critical | Total |','|---|---:|---:|---:|---:|---:|---:|') | Add-Content $env:GITHUB_STEP_SUMMARY
+          $full = Invoke-DependencyAudit -Label 'npm-audit-upstream-full' -Extra @('--package-lock-only','--include=dev')
+          $prod = Invoke-DependencyAudit -Label 'npm-audit-upstream-production' -Extra @('--package-lock-only','--omit=dev')
+          if ($full -gt 0 -or $prod -gt 0) { Write-Warning 'Upstream dependency findings detected.' }
+          exit 0
+
+      - name: Apply opt-in compatible npm fixes
+        if: inputs.build_mode == 'security-patched'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          $baseline = Get-Content "$out/npm-audit-upstream-full.json" -Raw | ConvertFrom-Json
+          if ([int]$baseline.metadata.vulnerabilities.total -gt 0) {
+            npm.cmd audit fix --package-lock-only --ignore-scripts --no-force --json --audit-level=low 1> "$out/npm-audit-fix.json" 2> "$out/npm-audit-fix-stderr.log"
+            $code = $LASTEXITCODE
+            "npm audit fix exit code: $code" | Set-Content "$out/npm-audit-fix-status.txt"
+            if ($code -notin @(0,1)) { throw "npm audit fix failed: $code" }
+            $fix = Get-Content "$out/npm-audit-fix.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($fix.error) { throw 'npm audit fix reported an error' }
+          } else {
+            'No known findings in initial full audit; no remediation needed.' | Set-Content "$out/npm-audit-fix-status.txt"
+          }
+          git diff --exit-code -- package.json Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Remediation modified package.json or Cargo.lock; manual review required' }
+          git diff --binary --output="$out/npm-lockfile-changes.patch" -- package-lock.json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record npm lockfile diff' }
+          exit 0
+
+      - name: Record effective dependency lockfiles
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          if ($env:BUILD_MODE -eq 'upstream') {
+            git diff --exit-code -- package.json package-lock.json Cargo.lock
+            if ($LASTEXITCODE -ne 0) { throw 'Upstream dependency files changed' }
+          }
+          Copy-Item package-lock.json "$out/package-lock.effective.json"
+          Copy-Item Cargo.lock "$out/Cargo.lock"
+          Get-FileHash package.json,package-lock.json,Cargo.lock -Algorithm SHA256 | Select-Object Path,Hash | ConvertTo-Json | Set-Content "$out/effective-lockfile-hashes.json"
+          exit 0
+
+      - name: Verify patched lockfile audit before installation
+        if: inputs.build_mode == 'security-patched'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          function Invoke-DependencyAudit {
+            param([string]$Label, [string[]]$Extra)
+            $auditArgs = @('audit','--json','--audit-level=low') + $Extra
+            & npm.cmd @auditArgs 1> "$out/$Label.json" 2> "$out/$Label-stderr.log"
+            $code = $LASTEXITCODE
+            "npm audit exit code: $code" | Set-Content "$out/$Label-status.txt"
+            $report = Get-Content "$out/$Label.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($report.error -or $null -eq $report.metadata.vulnerabilities.total -or $code -notin @(0,1)) { throw "Audit unavailable or invalid: $Label (exit $code)" }
+            $v = $report.metadata.vulnerabilities
+            $total = [int]$v.total
+            if (($total -gt 0 -and $code -eq 0) -or ($total -eq 0 -and $code -ne 0)) { throw "Inconsistent audit status: $Label" }
+            $line = "| $Label | $($v.info) | $($v.low) | $($v.moderate) | $($v.high) | $($v.critical) | $total |"
+            $line | Add-Content $env:GITHUB_STEP_SUMMARY
+            Write-Host $line
+            return $total
+          }
+          @('### npm dependency audit','| Report | Info | Low | Moderate | High | Critical | Total |','|---|---:|---:|---:|---:|---:|---:|') | Add-Content $env:GITHUB_STEP_SUMMARY
+          $full = Invoke-DependencyAudit -Label 'npm-audit-patched-lock-full' -Extra @('--package-lock-only','--include=dev')
+          $prod = Invoke-DependencyAudit -Label 'npm-audit-patched-lock-production' -Extra @('--package-lock-only','--omit=dev')
+          if ($full -gt 0 -or $prod -gt 0) { throw 'Known npm findings remain; patched installer blocked. Review diagnostics.' }
+          exit 0
+
       - name: Install locked dependencies
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
-          npm.cmd ci --no-audit 2>&1 | Tee-Object "$out/npm-ci.log"
+          npm.cmd ci --no-audit --include=dev 2>&1 | Tee-Object "$out/npm-ci.log"
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
           cargo fetch --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object "$out/cargo-fetch.log"
           if ($LASTEXITCODE -ne 0) { throw 'cargo fetch failed' }
 
-      - name: Report npm audit (no automatic fixes)
+      - name: Audit installed dependency tree
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
-          npm.cmd audit --json 1> "$out/npm-audit.json" 2> "$out/npm-audit-stderr.log"
-          $code = $LASTEXITCODE
-          "npm audit exit code: $code" | Set-Content "$out/npm-audit-status.txt"
-          if ($code -ne 0) { Write-Warning 'npm audit reported findings or an error; inspect report before using this build.' }
+          function Invoke-DependencyAudit {
+            param([string]$Label, [string[]]$Extra)
+            $auditArgs = @('audit','--json','--audit-level=low') + $Extra
+            & npm.cmd @auditArgs 1> "$out/$Label.json" 2> "$out/$Label-stderr.log"
+            $code = $LASTEXITCODE
+            "npm audit exit code: $code" | Set-Content "$out/$Label-status.txt"
+            $report = Get-Content "$out/$Label.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($report.error -or $null -eq $report.metadata.vulnerabilities.total -or $code -notin @(0,1)) { throw "Audit unavailable or invalid: $Label (exit $code)" }
+            $v = $report.metadata.vulnerabilities
+            $total = [int]$v.total
+            if (($total -gt 0 -and $code -eq 0) -or ($total -eq 0 -and $code -ne 0)) { throw "Inconsistent audit status: $Label" }
+            $line = "| $Label | $($v.info) | $($v.low) | $($v.moderate) | $($v.high) | $($v.critical) | $total |"
+            $line | Add-Content $env:GITHUB_STEP_SUMMARY
+            Write-Host $line
+            return $total
+          }
+          @('### npm dependency audit','| Report | Info | Low | Moderate | High | Critical | Total |','|---|---:|---:|---:|---:|---:|---:|') | Add-Content $env:GITHUB_STEP_SUMMARY
+          $full = Invoke-DependencyAudit -Label 'npm-audit-final-full' -Extra @('--include=dev')
+          $prod = Invoke-DependencyAudit -Label 'npm-audit-final-production' -Extra @('--omit=dev')
+          if ($full -gt 0 -or $prod -gt 0) {
+            if ($env:BUILD_MODE -eq 'security-patched') { throw 'Known npm findings remain; patched installer blocked.' }
+            Write-Warning 'Upstream build has npm audit findings; review reports before use.'
+          }
           exit 0
 
       - name: Type-check frontend
@@ -117,8 +242,17 @@ jobs:
           Copy-Item $config "$out/build-config.json"
           npm.cmd run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config $config -- --locked 2>&1 | Tee-Object "$out/compiler.log"
           if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
-          git diff --exit-code -- Cargo.lock package-lock.json
-          if ($LASTEXITCODE -ne 0) { throw 'Dependency lockfiles changed during build' }
+          git diff --exit-code -- package.json Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Source manifest or Rust lockfile changed' }
+          $expected = Get-Content "$out/effective-lockfile-hashes.json" -Raw | ConvertFrom-Json
+          foreach ($entry in $expected) {
+            if ((Get-FileHash -LiteralPath $entry.Path -Algorithm SHA256).Hash -ne $entry.Hash) { throw "Dependency file changed after lockfile capture: $($entry.Path)" }
+          }
+          if ($env:BUILD_MODE -eq 'upstream') {
+            git diff --exit-code -- package-lock.json
+            if ($LASTEXITCODE -ne 0) { throw 'Upstream npm lockfile changed' }
+          }
+          exit 0
 
       - name: Verify and stage installer
         run: |
@@ -136,12 +270,15 @@ jobs:
           "$hash  $($copy.Name)" | Set-Content "$dest/SHA256SUMS.txt"
           Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
           Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE/build-record/effective-lockfile-hashes.json" "$dest/effective-lockfile-hashes.json"
+          Copy-Item "$env:GITHUB_WORKSPACE/build-record/npm-audit-final-full.json","$env:GITHUB_WORKSPACE/build-record/npm-audit-final-production.json" $dest
+          "- Build mode: $env:BUILD_MODE" | Add-Content $env:GITHUB_STEP_SUMMARY
           "### Unofficial Caesium Windows x64 build`n- Source: ${{ steps.source.outputs.sha }}`n- Version: ${{ steps.source.outputs.version }}`n- Installer: $($copy.Name)`n- SHA-256: $hash`n- Unsigned; review audit report before installing." | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Upload installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Caesium-${{ steps.source.outputs.version }}-${{ steps.source.outputs.short }}-windows-x64
+          name: Caesium-${{ steps.source.outputs.version }}-${{ steps.source.outputs.short }}-${{ inputs.build_mode }}-windows-x64
           path: installer/
           if-no-files-found: error
           retention-days: 90
