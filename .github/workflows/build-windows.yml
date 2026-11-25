@@ -1,0 +1,156 @@
+name: Build Caesium Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Official Caesium branch, tag or full commit SHA (main = newest source)'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caesium-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: upstream
+    env:
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+      CI: 'true'
+    steps:
+      - name: Check out official source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Lymphatus/caesium-v3
+          ref: ${{ inputs.source_ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Record source identity
+        id: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot resolve source commit' }
+          $version = (Get-Content api/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^[0-9A-Za-z.+-]+$') { throw 'Invalid app version' }
+          if ((Get-Content package.json -Raw | ConvertFrom-Json).version -ne $version) { throw 'Application version mismatch' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short=$($sha.Substring(0,12))" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          "Official source: https://github.com/Lymphatus/caesium-v3/tree/$sha`nCommit: $sha`nVersion: $version`nTarget: x86_64-pc-windows-msvc`nBuild: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | Set-Content "$out/source.txt"
+          git log -1 --format=fuller | Add-Content "$out/source.txt"
+          Get-FileHash package-lock.json,Cargo.lock -Algorithm SHA256 | Format-List | Out-File "$out/lockfile-hashes.txt"
+          Copy-Item LICENSE.md "$out/UPSTREAM-LICENSE.md"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26.x'
+
+      - name: Install Rust and NASM
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust install failed' }
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+          if (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue)) {
+            choco install nasm --yes --no-progress
+            if ($LASTEXITCODE -notin @(0,1641,3010)) { throw 'NASM installation failed' }
+            $env:Path += ';' + [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';C:\ProgramData\chocolatey\bin;C:\Program Files\NASM;C:\Program Files (x86)\NASM'
+          }
+          $nasm = (Get-Command nasm.exe -ErrorAction Stop).Source
+          Split-Path $nasm -Parent | Add-Content $env:GITHUB_PATH
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          & {
+            node --version
+            npm.cmd --version
+            rustc --version --verbose
+            cargo --version
+            & $nasm -v
+            git --version
+          } | Tee-Object "$out/toolchain.txt"
+
+      - name: Install locked dependencies
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          npm.cmd ci --no-audit 2>&1 | Tee-Object "$out/npm-ci.log"
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          cargo fetch --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object "$out/cargo-fetch.log"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fetch failed' }
+
+      - name: Report npm audit (no automatic fixes)
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          npm.cmd audit --json 1> "$out/npm-audit.json" 2> "$out/npm-audit-stderr.log"
+          $code = $LASTEXITCODE
+          "npm audit exit code: $code" | Set-Content "$out/npm-audit-status.txt"
+          if ($code -ne 0) { Write-Warning 'npm audit reported findings or an error; inspect report before using this build.' }
+          exit 0
+
+      - name: Type-check frontend
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          npm.cmd run check 2>&1 | Tee-Object "$out/typecheck.log"
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript checks failed' }
+
+      - name: Build unsigned Windows installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          $config = Join-Path $env:RUNNER_TEMP 'caesium-local-build.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $config -Encoding utf8NoBOM
+          Copy-Item $config "$out/build-config.json"
+          npm.cmd run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config $config -- --locked 2>&1 | Tee-Object "$out/compiler.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
+          git diff --exit-code -- Cargo.lock package-lock.json
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency lockfiles changed during build' }
+
+      - name: Verify and stage installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -File -Filter '*setup.exe')
+          if ($files.Count -ne 1) { throw "Expected exactly one installer, got $($files.Count)" }
+          $file = $files[0]
+          if ($file.Length -lt 1024) { throw 'Installer unexpectedly small' }
+          $dest = Join-Path $env:GITHUB_WORKSPACE 'installer'
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Copy-Item -LiteralPath $file.FullName -Destination $dest
+          $copy = Get-Item (Join-Path $dest $file.Name)
+          $hash = (Get-FileHash -LiteralPath $copy.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Installer copy hash mismatch' }
+          "$hash  $($copy.Name)" | Set-Content "$dest/SHA256SUMS.txt"
+          Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
+          Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
+          "### Unofficial Caesium Windows x64 build`n- Source: ${{ steps.source.outputs.sha }}`n- Version: ${{ steps.source.outputs.version }}`n- Installer: $($copy.Name)`n- SHA-256: $hash`n- Unsigned; review audit report before installing." | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Caesium-${{ steps.source.outputs.version }}-${{ steps.source.outputs.short }}-windows-x64
+          path: installer/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-record/
+          if-no-files-found: warn
+          retention-days: 90
