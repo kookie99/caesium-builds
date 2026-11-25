@@ -27,6 +27,8 @@ jobs:
           "$GOBIN/actionlint" -color
       - name: Test verifier on Linux
         run: python scripts/verify_payload.py --self-test
+      - name: Test exact independent manifest verifier with tamper fixtures
+        run: python scripts/test_manifest_verifier.py
 
   windows:
     runs-on: windows-2025
