@@ -409,11 +409,19 @@ jobs:
           $rust = Get-Content "$out/cargo-audit-status.json" -Raw | ConvertFrom-Json
           $npmFull = Get-Content "$out/npm-audit-final-full.json" -Raw | ConvertFrom-Json
           $npmProd = Get-Content "$out/npm-audit-final-production.json" -Raw | ConvertFrom-Json
+          Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
+          Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE/build-record/effective-lockfile-hashes.json" "$dest/effective-lockfile-hashes.json"
+          Copy-Item "$out/npm-audit-final-full.json","$out/npm-audit-final-production.json","$out/cargo-audit.json","$out/cargo-audit-status.json","$out/installer-payload-verification.json" $dest
+          $support = @(Get-ChildItem -LiteralPath $dest -File | Where-Object Name -ne $copy.Name | Sort-Object Name | ForEach-Object {
+            @{name=$_.Name;size_bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+          })
           $manifest = [ordered]@{
-            schema_version=1; app_version='${{ steps.source.outputs.version }}'; source_repository='Lymphatus/caesium-v3'; source_commit='${{ steps.source.outputs.sha }}'; build_mode=$env:BUILD_MODE; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; target='x86_64-pc-windows-msvc'
+            schema_version=2; app_version='${{ steps.source.outputs.version }}'; source_repository='Lymphatus/caesium-v3'; source_commit='${{ steps.source.outputs.sha }}'; build_mode=$env:BUILD_MODE; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; target='x86_64-pc-windows-msvc'
             installer=@{name=$copy.Name;size_bytes=$copy.Length;sha256=$hash}
             executable=@{name=$binary.Name;size_bytes=$embedded[0].Length;sha256=$embeddedHash;compiled_sha256=$binaryHash;expected_embedded_sha256=$expectedHash;comparison=$comparison;marker_offset=$markerOffset;embedded_hash_verified=$true}
             dependency_files=@(Get-Content "$out/effective-lockfile-hashes.json" -Raw | ConvertFrom-Json | ForEach-Object { @{name=[IO.Path]::GetFileName($_.Path);sha256=$_.Hash.ToLowerInvariant()} })
+            supporting_files=$support
             npm_full_findings=[int]$npmFull.metadata.vulnerabilities.total; npm_production_findings=[int]$npmProd.metadata.vulnerabilities.total; rust_audit=$rust; rust_tests='passed'; signed_by_upstream=$false
           }
           $manifest | ConvertTo-Json -Depth 12 | Set-Content "$dest/build-manifest.json"
@@ -422,10 +430,6 @@ jobs:
           "manifest_sha=$((Get-FileHash "$dest/build-manifest.json" -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "producer_attempt=$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
           "- Installed executable SHA-256: $embeddedHash (verified: $comparison)" | Add-Content $env:GITHUB_STEP_SUMMARY
-          Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
-          Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE/build-record/effective-lockfile-hashes.json" "$dest/effective-lockfile-hashes.json"
-          Copy-Item "$out/npm-audit-final-full.json","$out/npm-audit-final-production.json","$out/cargo-audit.json","$out/cargo-audit-status.json","$out/installer-payload-verification.json" $dest
           "- Build mode: $env:BUILD_MODE" | Add-Content $env:GITHUB_STEP_SUMMARY
           "### Unofficial Caesium Windows x64 build`n- Source: ${{ steps.source.outputs.sha }}`n- Version: ${{ steps.source.outputs.version }}`n- Installer: $($copy.Name)`n- SHA-256: $hash`n- Unsigned; review audit report before installing." | Add-Content $env:GITHUB_STEP_SUMMARY
 
@@ -497,7 +501,17 @@ jobs:
           assert data["rust_audit"]["policy"] == os.environ["EXPECTED_RUST_POLICY"]
           assert data["source_commit"] == os.environ["EXPECTED_SOURCE"]
           assert str(data["run_attempt"]) == os.environ["EXPECTED_ATTEMPT"]
-          assert data["schema_version"] == 1
+          assert data["schema_version"] == 2
+          supporting = data["supporting_files"]
+          names = [record["name"] for record in supporting]
+          assert len(names) == len(set(names))
+          assert set(names) == {"SHA256SUMS.txt", "INSTALLED-EXE-SHA256.txt", "UPSTREAM-LICENSE.md", "source.txt", "effective-lockfile-hashes.json", "npm-audit-final-full.json", "npm-audit-final-production.json", "cargo-audit.json", "cargo-audit-status.json", "installer-payload-verification.json"}
+          assert {p.name for p in manifest.parent.iterdir() if p.is_file()} == set(names) | {manifest.name, exe.name}
+          for record in supporting:
+              support = manifest.parent / record["name"]
+              assert support.is_file()
+              assert support.stat().st_size == record["size_bytes"]
+              assert digest(support) == record["sha256"]
           assert data["target"] == "x86_64-pc-windows-msvc"
           assert data["source_repository"] == "Lymphatus/caesium-v3"
           assert data["rust_tests"] == "passed"
@@ -512,6 +526,11 @@ jobs:
           assert payload["embedded_sha256"] == data["executable"]["sha256"]
           assert payload["compiled_sha256"] == data["executable"]["compiled_sha256"]
           assert payload["comparison"] == data["executable"]["comparison"]
+          assert payload["expected_embedded_sha256"] == data["executable"]["expected_embedded_sha256"]
+          assert payload["marker_offset"] == data["executable"]["marker_offset"]
+          assert payload["embedded_size"] == data["executable"]["size_bytes"]
+          rust_status = json.loads((manifest.parent / "cargo-audit-status.json").read_text(encoding="utf-8-sig"))
+          assert rust_status == data["rust_audit"]
           assert data["executable"]["embedded_hash_verified"] is True
           assert data["executable"]["sha256"] == data["executable"]["expected_embedded_sha256"]
           assert data["executable"]["comparison"] in ("exact", "tauri-nsis-marker")
