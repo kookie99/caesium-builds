@@ -28,7 +28,7 @@ The default exact toolchain versions match the successful November 25, 2026 buil
 - Generates an npm CycloneDX inventory and Windows-filtered Cargo metadata. These are dependency inventories, not a complete SBOM of the final executable.
 - Runs TypeScript checks, an optimized Windows x64 Tauri/NSIS build and upstream Rust library regression tests. The tests include file collision and atomic output behavior in the current upstream revision.
 - Checks dependency hashes again after compilation and tests and rejects unexpected tracked source changes.
-- Extracts the NSIS installer without executing it, checks the AMD64 PE header and verifies that its embedded application executable matches the compiled application byte for byte.
+- Extracts the NSIS installer without executing it, checks the AMD64 PE header, and verifies the embedded executable against the compiled binary. Tauri temporarily replaces its first `__TAURI_BUNDLE_TYPE_VAR_UNK` marker with `__TAURI_BUNDLE_TYPE_VAR_NSS` during NSIS bundling and restores the standalone binary afterward. Only an exact match or the exact documented marker substitution is accepted; any other change blocks publication. The installed-executable hash is calculated from the embedded payload.
 - Publishes a structured manifest, installer SHA-256 and the installed-executable SHA-256.
 - Downloads the exact installer artifact in an independent Linux job, checks its hashes and recorded build identity, and creates GitHub artifact attestations for the installer and manifest. The attestation job has scoped OIDC/attestation permissions, does not check out upstream code, and never executes the installer.
 
@@ -49,7 +49,7 @@ Diagnostics archive:
 - Original/effective npm lockfiles, Rust lockfile and patch in patched mode
 - All npm and RustSec reports, audit status, dependency inventories
 - Runner/toolchain information and source identity
-- Compiler, regression test and installer extraction logs
+- Compiler, regression test and installer extraction logs, plus payload comparison details and both executable hashes
 
 Artifacts expire after 90 days. Keep important installers and manifests locally. No automatic release publishing or installation occurs.
 
