@@ -1,4 +1,5 @@
 name: Build Caesium Windows x64
+run-name: Caesium ${{ inputs.source_ref }} / ${{ inputs.build_mode }} (#${{ github.run_number }})
 
 on:
   workflow_dispatch:
@@ -16,6 +17,24 @@ on:
         options:
           - upstream
           - security-patched
+      node_version:
+        description: 'Node.js version (tested exact default; 26.x for newer 26 releases)'
+        required: true
+        default: '26.13.1'
+        type: string
+      rust_version:
+        description: 'Rust version (tested exact default; stable for newest stable)'
+        required: true
+        default: '1.100.0'
+        type: string
+      rust_audit_policy:
+        description: 'Report RustSec findings or block on known Rust vulnerabilities'
+        required: true
+        default: report
+        type: choice
+        options:
+          - report
+          - block
 
 permissions:
   contents: read
@@ -27,7 +46,11 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 75
+    outputs:
+      installer_id: ${{ steps.upload.outputs.artifact-id }}
+      installer_sha: ${{ steps.stage.outputs.installer_sha }}
+      manifest_sha: ${{ steps.stage.outputs.manifest_sha }}
     defaults:
       run:
         shell: pwsh
@@ -37,14 +60,30 @@ jobs:
       NO_COLOR: '1'
       CI: 'true'
       BUILD_MODE: ${{ inputs.build_mode }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      NODE_REQUESTED: ${{ inputs.node_version }}
+      RUST_REQUESTED: ${{ inputs.rust_version }}
+      RUST_AUDIT_POLICY: ${{ inputs.rust_audit_policy }}
     steps:
+      - name: Validate build inputs
+        working-directory: ${{ github.workspace }}
+        run: |
+          if ($env:SOURCE_REF -cnotmatch '^(main|[0-9a-fA-F]{40}|v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)$') { throw 'Use main, a full commit SHA, or an official version tag' }
+          if ($env:NODE_REQUESTED -cnotmatch '^[0-9]+\.(?:x|[0-9]+\.[0-9]+)$') { throw 'Use an exact Node version or a major.x selector' }
+          if ($env:RUST_REQUESTED -cnotmatch '^(stable|[0-9]+\.[0-9]+\.[0-9]+)$') { throw 'Use stable or an exact Rust version' }
+          if ($env:BUILD_MODE -notin @('upstream','security-patched') -or $env:RUST_AUDIT_POLICY -notin @('report','block')) { throw 'Invalid build policy' }
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          [ordered]@{source_ref=$env:SOURCE_REF;build_mode=$env:BUILD_MODE;node_requested=$env:NODE_REQUESTED;rust_requested=$env:RUST_REQUESTED;rust_audit_policy=$env:RUST_AUDIT_POLICY;workflow_sha=$env:GITHUB_SHA;runner_os=$env:RUNNER_OS;runner_arch=$env:RUNNER_ARCH;runner_image=$env:ImageOS;runner_image_version=$env:ImageVersion} | ConvertTo-Json | Set-Content "$out/build-inputs.json"
+
       - name: Check out official source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Lymphatus/caesium-v3
           ref: ${{ inputs.source_ref }}
           path: upstream
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Record source identity
         id: source
@@ -52,7 +91,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $sha = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot resolve source commit' }
-          $version = (Get-Content api/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($env:SOURCE_REF -match '^v') {
+            $tagCommit = git rev-parse "refs/tags/$($env:SOURCE_REF)^{commit}"
+            if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $sha) { throw 'Official tag does not resolve to checked-out commit' }
+          } else {
+            git merge-base --is-ancestor $sha refs/remotes/origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Commit is not reachable from official upstream main' }
+            if ($env:SOURCE_REF -ne 'main' -and $env:SOURCE_REF -ne $sha) { throw 'Requested commit mismatch' }
+          }
+          $tauri = Get-Content api/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = $tauri.version
+          if ($tauri.identifier -ne 'com.saerasoft.caesium' -or $tauri.mainBinaryName -ne 'Caesium Image Compressor') { throw 'Upstream application identity changed; review installer compatibility' }
           if ($version -notmatch '^[0-9A-Za-z.+-]+$') { throw 'Invalid app version' }
           if ((Get-Content package.json -Raw | ConvertFrom-Json).version -ne $version) { throw 'Application version mismatch' }
           "sha=$sha" >> $env:GITHUB_OUTPUT
@@ -70,17 +119,20 @@ jobs:
           Copy-Item LICENSE.md "$out/UPSTREAM-LICENSE.md"
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.x'
+          node-version: ${{ inputs.node_version }}
+          architecture: x64
+          package-manager-cache: false
 
       - name: Install Rust and NASM
         run: |
           $ErrorActionPreference = 'Stop'
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          $toolchain = "$env:RUST_REQUESTED-x86_64-pc-windows-msvc"
+          rustup toolchain install $toolchain --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust install failed' }
-          rustup default stable-x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+          $env:RUSTUP_TOOLCHAIN = $toolchain
+          "RUSTUP_TOOLCHAIN=$toolchain" | Add-Content $env:GITHUB_ENV
           if (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue)) {
             choco install nasm --yes --no-progress
             if ($LASTEXITCODE -notin @(0,1641,3010)) { throw 'NASM installation failed' }
@@ -97,6 +149,47 @@ jobs:
             & $nasm -v
             git --version
           } | Tee-Object "$out/toolchain.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Toolchain discovery failed' }
+          $actualNode = (node --version).TrimStart('v')
+          if ($env:NODE_REQUESTED -notmatch '\.x$' -and $actualNode -ne $env:NODE_REQUESTED) { throw 'Node version mismatch' }
+          $actualRust = (rustc --version).Split(' ')[1]
+          if ($env:RUST_REQUESTED -ne 'stable' -and $actualRust -ne $env:RUST_REQUESTED) { throw 'Rust version mismatch' }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -all -products '*' -format json | Set-Content "$out/visual-studio.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Visual Studio discovery failed' }
+
+      - name: Audit Rust dependencies (RustSec)
+        working-directory: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'caesium-rust-audit'
+          New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+          Push-Location $toolRoot
+          try {
+            cargo install cargo-audit --version '=0.23.0' --locked --root $toolRoot 2>&1 | Tee-Object "$out/cargo-audit-install.log"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot install pinned cargo-audit' }
+            $env:Path = "$toolRoot\bin;$env:Path"
+            cargo audit --version | Set-Content "$out/cargo-audit-version.txt"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot run cargo-audit' }
+            $lock = Join-Path $env:GITHUB_WORKSPACE 'upstream/Cargo.lock'
+            cargo audit --json --file $lock 1> "$out/cargo-audit.json" 2> "$out/cargo-audit-stderr.log"
+            $code = $LASTEXITCODE
+            $report = Get-Content "$out/cargo-audit.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $report.vulnerabilities.count -or $null -eq $report.vulnerabilities.found -or $code -notin @(0,1)) { throw 'RustSec audit unavailable or invalid' }
+            $count = [int]$report.vulnerabilities.count
+            if (($count -gt 0) -ne [bool]$report.vulnerabilities.found -or ($count -gt 0 -and $code -ne 1) -or ($count -eq 0 -and $code -ne 0)) { throw 'RustSec audit status inconsistent' }
+            $warnings = 0
+            if ($report.warnings) { foreach ($p in $report.warnings.PSObject.Properties) { if ($p.Value -is [array]) { $warnings += $p.Value.Count } } }
+            [ordered]@{policy=$env:RUST_AUDIT_POLICY;vulnerabilities=$count;informational_warnings=$warnings;exit_code=$code} | ConvertTo-Json | Set-Content "$out/cargo-audit-status.json"
+            "### RustSec (entire Cargo.lock)`n- Known vulnerabilities: $count`n- Informational warnings: $warnings`n- Policy: $env:RUST_AUDIT_POLICY" | Add-Content $env:GITHUB_STEP_SUMMARY
+            if ($count -gt 0) {
+              if ($env:RUST_AUDIT_POLICY -eq 'block') { throw 'RustSec vulnerabilities found; installer blocked' }
+              Write-Warning 'RustSec vulnerabilities reported; inspect diagnostics before installation.'
+            }
+          } finally { Pop-Location }
+          exit 0
 
       - name: Audit original dependency lockfile
         run: |
@@ -227,6 +320,16 @@ jobs:
           }
           exit 0
 
+      - name: Record dependency inventories
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          npm.cmd sbom --sbom-format cyclonedx --package-lock-only 1> "$out/npm-sbom.cdx.json" 2> "$out/npm-sbom-stderr.log"
+          if ($LASTEXITCODE -ne 0) { throw 'npm SBOM generation failed' }
+          $sbom = Get-Content "$out/npm-sbom.cdx.json" -Raw | ConvertFrom-Json
+          if ($sbom.bomFormat -ne 'CycloneDX' -or !$sbom.components) { throw 'Invalid npm SBOM' }
+          cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc 1> "$out/cargo-metadata-windows.json" 2> "$out/cargo-metadata-stderr.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+
       - name: Type-check frontend
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
@@ -254,7 +357,26 @@ jobs:
           }
           exit 0
 
+      - name: Run upstream Rust regression tests
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          cargo test --locked --release --workspace --lib --target x86_64-pc-windows-msvc 2>&1 | Tee-Object "$out/rust-tests.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Rust regression tests failed' }
+          $results = Select-String -Path "$out/rust-tests.log" -Pattern 'test result:'
+          if (!$results) { throw 'No Rust test summary found' }
+          "### Rust regression tests" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $results.Line | ForEach-Object { "- $_" | Add-Content $env:GITHUB_STEP_SUMMARY }
+          $expected = Get-Content "$out/effective-lockfile-hashes.json" -Raw | ConvertFrom-Json
+          foreach ($entry in $expected) {
+            if ((Get-FileHash -LiteralPath $entry.Path -Algorithm SHA256).Hash -ne $entry.Hash) { throw "Dependency file changed during tests: $($entry.Path)" }
+          }
+          $allowed = @('tsconfig.node.tsbuildinfo')
+          if ($env:BUILD_MODE -eq 'security-patched') { $allowed += 'package-lock.json' }
+          $changed = @(git diff --name-only HEAD)
+          if ($LASTEXITCODE -ne 0 -or @($changed | Where-Object { $_ -notin $allowed }).Count -gt 0) { throw 'Unexpected tracked source modifications after build/tests' }
+
       - name: Verify and stage installer
+        id: stage
         run: |
           $ErrorActionPreference = 'Stop'
           $files = @(Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -File -Filter '*setup.exe')
@@ -267,7 +389,51 @@ jobs:
           $copy = Get-Item (Join-Path $dest $file.Name)
           $hash = (Get-FileHash -LiteralPath $copy.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hash -ne (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Installer copy hash mismatch' }
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build-record'
+          $binary = Get-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/Caesium Image Compressor.exe'
+          function Assert-X64PE([string]$Path) {
+            $stream = [IO.File]::OpenRead($Path)
+            $reader = [IO.BinaryReader]::new($stream)
+            try {
+              if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Missing MZ header' }
+              $stream.Position = 0x3C
+              $peOffset = $reader.ReadInt32()
+              if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 6)) { throw 'Invalid PE offset' }
+              $stream.Position = $peOffset
+              if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Not an AMD64 PE executable' }
+            } finally { $reader.Dispose() }
+          }
+          Assert-X64PE $binary.FullName
+          $binaryHash = (Get-FileHash -LiteralPath $binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (!$seven) { $seven = Join-Path $env:ProgramFiles '7-Zip/7z.exe' }
+          if (!(Test-Path -LiteralPath $seven)) { throw '7-Zip unavailable for installer verification' }
+          $unpack = Join-Path $env:RUNNER_TEMP 'caesium-nsis-verify'
+          New-Item -ItemType Directory -Path $unpack -Force | Out-Null
+          & $seven x -y "-o$unpack" $copy.FullName 2>&1 | Tee-Object "$out/installer-extraction.log"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS extraction failed' }
+          $embedded = @(Get-ChildItem -LiteralPath $unpack -Recurse -File | Where-Object Name -eq $binary.Name)
+          if ($embedded.Count -ne 1) { throw 'Expected one embedded application executable' }
+          $embeddedHash = (Get-FileHash -LiteralPath $embedded[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($embeddedHash -ne $binaryHash) { throw 'Embedded application differs from compiled binary' }
+          Assert-X64PE $embedded[0].FullName
           "$hash  $($copy.Name)" | Set-Content "$dest/SHA256SUMS.txt"
+          "$binaryHash  $($binary.Name)" | Set-Content "$dest/INSTALLED-EXE-SHA256.txt"
+          $rust = Get-Content "$out/cargo-audit-status.json" -Raw | ConvertFrom-Json
+          $npmFull = Get-Content "$out/npm-audit-final-full.json" -Raw | ConvertFrom-Json
+          $npmProd = Get-Content "$out/npm-audit-final-production.json" -Raw | ConvertFrom-Json
+          $manifest = [ordered]@{
+            schema_version=1; app_version='${{ steps.source.outputs.version }}'; source_repository='Lymphatus/caesium-v3'; source_commit='${{ steps.source.outputs.sha }}'; build_mode=$env:BUILD_MODE; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; target='x86_64-pc-windows-msvc'
+            installer=@{name=$copy.Name;size_bytes=$copy.Length;sha256=$hash}
+            executable=@{name=$binary.Name;size_bytes=$binary.Length;sha256=$binaryHash;embedded_hash_verified=$true}
+            dependency_files=@(Get-Content "$out/effective-lockfile-hashes.json" -Raw | ConvertFrom-Json | ForEach-Object { @{name=[IO.Path]::GetFileName($_.Path);sha256=$_.Hash.ToLowerInvariant()} })
+            npm_full_findings=[int]$npmFull.metadata.vulnerabilities.total; npm_production_findings=[int]$npmProd.metadata.vulnerabilities.total; rust_audit=$rust; rust_tests='passed'; signed_by_upstream=$false
+          }
+          $manifest | ConvertTo-Json -Depth 12 | Set-Content "$dest/build-manifest.json"
+          Copy-Item "$dest/build-manifest.json" "$out/build-manifest.json"
+          "installer_sha=$hash" >> $env:GITHUB_OUTPUT
+          "manifest_sha=$((Get-FileHash "$dest/build-manifest.json" -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "- Installed executable SHA-256: $binaryHash (embedded payload matched)" | Add-Content $env:GITHUB_STEP_SUMMARY
           Copy-Item LICENSE.md "$dest/UPSTREAM-LICENSE.md"
           Copy-Item "$env:GITHUB_WORKSPACE/build-record/source.txt" "$dest/source.txt"
           Copy-Item "$env:GITHUB_WORKSPACE/build-record/effective-lockfile-hashes.json" "$dest/effective-lockfile-hashes.json"
@@ -276,18 +442,79 @@ jobs:
           "### Unofficial Caesium Windows x64 build`n- Source: ${{ steps.source.outputs.sha }}`n- Version: ${{ steps.source.outputs.version }}`n- Installer: $($copy.Name)`n- SHA-256: $hash`n- Unsigned; review audit report before installing." | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Upload installer
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Caesium-${{ steps.source.outputs.version }}-${{ steps.source.outputs.short }}-${{ inputs.build_mode }}-windows-x64
+          name: Caesium-${{ steps.source.outputs.version }}-${{ steps.source.outputs.short }}-${{ inputs.build_mode }}-windows-x64-run${{ github.run_id }}-a${{ github.run_attempt }}
           path: installer/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 90
 
       - name: Upload build diagnostics
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: build-record/
           if-no-files-found: warn
           retention-days: 90
+
+  attest:
+    name: Independently verify and attest build
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download exact installer artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.installer_id }}
+          path: verified
+          digest-mismatch: error
+
+      - name: Verify hashes and build identity without executing artifact
+        env:
+          EXPECTED_INSTALLER_SHA: ${{ needs.build.outputs.installer_sha }}
+          EXPECTED_MANIFEST_SHA: ${{ needs.build.outputs.manifest_sha }}
+          EXPECTED_MODE: ${{ inputs.build_mode }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path("verified")
+          manifests = list(root.rglob("build-manifest.json"))
+          assert len(manifests) == 1, "Expected one manifest"
+          manifest = manifests[0]
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          assert digest(manifest) == os.environ["EXPECTED_MANIFEST_SHA"]
+          data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+          files = list(root.rglob("*setup.exe"))
+          assert len(files) == 1
+          exe = files[0]
+          assert exe.name == data["installer"]["name"]
+          assert exe.stat().st_size == data["installer"]["size_bytes"]
+          assert digest(exe) == data["installer"]["sha256"] == os.environ["EXPECTED_INSTALLER_SHA"]
+          assert data["workflow_commit"] == os.environ["GITHUB_SHA"]
+          assert str(data["run_id"]) == os.environ["GITHUB_RUN_ID"]
+          assert data["build_mode"] == os.environ["EXPECTED_MODE"]
+          assert data["executable"]["embedded_hash_verified"] is True
+          if data["build_mode"] == "security-patched":
+              assert data["npm_full_findings"] == data["npm_production_findings"] == 0
+          if data["rust_audit"]["policy"] == "block":
+              assert data["rust_audit"]["vulnerabilities"] == 0
+          print("Installer bytes, manifest, run identity and security policy verified.")
+          PY
+
+      - name: Attest installer and build manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            verified/**/*setup.exe
+            verified/**/build-manifest.json
+          create-storage-record: false
