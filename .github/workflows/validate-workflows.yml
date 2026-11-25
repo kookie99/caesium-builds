@@ -40,20 +40,98 @@ jobs:
         run: |
           python scripts/verify_payload.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Verifier tests failed' }
-      - name: Exercise verified RustSec binary download and CLI
+      - name: Check out known upstream lockfile for audit preflight
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Lymphatus/caesium-v3
+          ref: c9878771d4f0017068eac71774687ec776d37018
+          path: reference-source
+          persist-credentials: false
+          sparse-checkout: Cargo.lock
+          sparse-checkout-cone-mode: false
+      - name: Run exact production RustSec helper in report mode
         shell: pwsh
         run: |
-          $root = Join-Path $env:RUNNER_TEMP 'audit-preflight'
-          New-Item -ItemType Directory -Path $root -Force | Out-Null
-          $zip = Join-Path $root 'cargo-audit.zip'
-          Invoke-WebRequest -Uri 'https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-pc-windows-msvc-v0.23.0.zip' -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 2 -TimeoutSec 120
-          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne 'aafeb61206730029601a72e669a12231f8674427e6248d02f6cb382cb36d56b4') { throw 'RustSec archive hash mismatch' }
-          Expand-Archive -LiteralPath $zip -DestinationPath "$root/unpacked"
-          $bins = @(Get-ChildItem -LiteralPath "$root/unpacked" -Recurse -File -Filter cargo-audit.exe)
-          if ($bins.Count -ne 1) { throw 'Expected one cargo-audit binary' }
-          $bin = $bins[0].FullName
-          $version = (& $bin --version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch '0\.23\.0') { throw 'Unexpected scanner version' }
-          Write-Host $version
-          & $bin audit --help
-          if ($LASTEXITCODE -ne 0) { throw 'Scanner audit subcommand failed' }
+          & ./scripts/audit_rust.ps1 -LockFile './reference-source/Cargo.lock' -OutputDirectory './audit-preflight' -Policy report
+          $report = Get-Content ./audit-preflight/cargo-audit-status.json -Raw | ConvertFrom-Json
+          if ($report.policy -ne 'report' -or $null -eq $report.vulnerabilities) { throw 'Audit preflight produced invalid status' }
+          Get-Content ./audit-preflight/cargo-audit-status.json | Write-Host
+          exit 0
+      - name: Save audit preflight reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rustsec-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit-preflight/
+          if-no-files-found: warn
+          retention-days: 14
+
+  reference-installer:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check whether historical installer artifact is still available
+        id: reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $meta = Invoke-RestMethod -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/15063806797" -Headers @{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json'} -SkipHttpErrorCheck -StatusCodeVariable code
+          if ($code -eq 404 -or ($code -eq 200 -and $meta.expired)) {
+            'available=false' >> $env:GITHUB_OUTPUT
+            Write-Host 'Historical fixture no longer retained; synthetic tests still run.'
+          } elseif ($code -eq 200 -and $meta.id -eq 15063806797) {
+            'available=true' >> $env:GITHUB_OUTPUT
+          } else { throw "Unexpected historical artifact API response: $code" }
+      - name: Download the previous successful installer
+        if: steps.reference.outputs.available == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45700323410
+          artifact-ids: '15063806797'
+          path: reference-installer
+          digest-mismatch: error
+      - name: Verify historical installer and exercise real PE marker
+        if: steps.reference.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem reference-installer -Recurse -File -Filter '*setup.exe')
+          if ($files.Count -ne 1) { throw 'Expected exactly one historical installer' }
+          if ((Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash -ne '7addd6f3c3507563556b8ce67a85f48580a97474ef14faef6ab3c49600a05c54') { throw 'Historical installer hash mismatch' }
+          $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (!$seven) { $seven = Join-Path $env:ProgramFiles '7-Zip/7z.exe' }
+          $folder = Join-Path $env:RUNNER_TEMP 'reference-extracted'
+          New-Item -ItemType Directory -Path $folder -Force | Out-Null
+          & $seven x -y "-o$folder" $files[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Historical installer extraction failed' }
+          $bins = @(Get-ChildItem -LiteralPath $folder -Recurse -File | Where-Object Name -eq 'Caesium Image Compressor.exe')
+          if ($bins.Count -ne 1) { throw 'Expected one historical application binary' }
+          $env:REFERENCE_EXE = $bins[0].FullName
+          @'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from verify_payload import OLD, NEW, compare_payload, sha
+          embedded = Path(os.environ["REFERENCE_EXE"]).read_bytes()
+          offset = embedded.find(NEW)
+          if offset < 0:
+              raise ValueError("Historical bundled executable lacks Tauri NSIS marker")
+          # Reconstruct a synthetic unpatched input from the actual payload.
+          # This is a regression fixture, not evidence of the original standalone binary.
+          synthetic = embedded[:offset] + OLD + embedded[offset + len(NEW):]
+          result = compare_payload(synthetic, embedded)
+          if result["comparison"] != "tauri-nsis-marker":
+              raise ValueError("Historical marker comparison failed")
+          print("Historical embedded SHA-256:", sha(embedded))
+          print("Historical marker offset:", offset)
+          print("Actual NSIS extraction and PE verification passed.")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Historical payload fixture failed' }
