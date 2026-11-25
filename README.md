@@ -1,39 +1,87 @@
-# caesium-builds
+# Caesium Windows builds
 
-Automated Windows x64 builds of Caesium Image Compressor v3 from the [official upstream repository](https://github.com/Lymphatus/caesium-v3).
+On-demand Windows x64 installers of [Caesium Image Compressor v3](https://github.com/Lymphatus/caesium-v3), built from official upstream source. These are **unofficial, unsigned development builds**, not releases endorsed by the upstream developer. The upstream MIT license is included with each installer.
 
-These are **unofficial, unsigned development builds**, not releases endorsed by the upstream developer. Upstream source is MIT-licensed; its license accompanies the installer artifact.
+## Run a build
 
-## Build a Windows installer
+Open [Build Caesium Windows x64](https://github.com/kookie99/caesium-builds/actions/workflows/build-windows.yml) and select **Run workflow** on `main`.
 
-1. Open [Build Caesium Windows x64](https://github.com/kookie99/caesium-builds/actions/workflows/build-windows.yml).
-2. Select **Run workflow** on the **main** branch.
-3. Enter an upstream source ref (default: `main`). A full commit SHA is recommended when reproducing a particular build.
-4. Select a build mode (see below).
-5. Start the workflow and open the run when it completes.
-6. Review the job summary and the `build-diagnostics-*` artifact. Download the installer only after reviewing the reports.
-
-## Build modes
-
-| Mode | Dependency behavior | npm audit policy |
+| Input | Default | Options / purpose |
 | --- | --- | --- |
-| `upstream` (default) | Preserves upstream package.json, package-lock.json and Cargo.lock | Reports known findings; valid audits required, findings alone do not block build |
-| `security-patched` | Opt-in compatible npm audit fixes to the lockfile only; no forced upgrades | Requires zero reported findings in both full and production audits of the patched lockfile and installed tree; otherwise no installer is uploaded |
+| source_ref | `main` | Official main, a full commit reachable from main, or an official version tag |
+| build_mode | `upstream` | Choose `security-patched` for compatible npm security remediation |
+| node_version | `26.13.1` | Tested exact version; select `26.x` or a newer exact version if necessary |
+| rust_version | `1.100.0` | Tested exact version; `stable` selects newest stable |
+| rust_audit_policy | `report` | `block` refuses to build with reported RustSec vulnerabilities |
 
-Both modes audit the original lockfile and the installed dependency tree, with separate full and production-only JSON reports. The patched mode also audits the remediated lockfile before installing dependencies. The remediation command is `npm audit fix --package-lock-only --ignore-scripts --no-force`; package.json and Cargo.lock must remain unchanged. If fixes require changing declared dependency ranges or leave findings, the patched build fails rather than forcing an upgrade. Failed runs retain available diagnostics.
+For personal use, select `security-patched`, then choose `block` for RustSec if you want the strictest policy. Report mode is useful for investigating Rust advisories, including crates for platforms other than Windows; do not treat a report-mode success with findings as security approval. Review all audit reports before installation.
 
-The build uses a standard GitHub-hosted Windows x64 runner, Node.js 26, stable Rust/MSVC, NASM, npm ci, locked Rust dependencies, TypeScript checks and Tauri's NSIS bundler. The source SHA, toolchain versions, original and effective npm lockfiles, effective dependency file hashes, lockfile patch (patched mode), upstream license, compiler logs and installer SHA-256 are recorded. Installer artifacts identify the build mode in their names. Dependency file hashes are rechecked after compilation.
+The default exact toolchain versions match the successful November 25, 2026 build, not a claim that they are always the latest. MSVC, NASM and runner images can still change. New upstream requirements may require adjusting the toolchain inputs.
 
-An npm production-only audit is a dependency classification, not proof that the affected code ships in the final Tauri binary. Zero reported npm findings does not establish that a build is secure; Rust vulnerabilities, native libraries, supply chain attacks and runtime behavior are not comprehensively audited by this workflow. Builds are unsigned. Toolchains and registry advisories can change over time; recorded inputs improve traceability but do not guarantee bit-for-bit reproducibility.
+## What the workflow verifies
 
-Artifacts expire after 90 days. No automated installation, source synchronization, release publishing or repository write token is required by the workflow.
+- Restricts source refs to official main history or version tags; records the actual commit, workflow commit, runner image and toolchain.
+- Uses SHA-pinned official GitHub Actions and read-only build permissions; checkout credentials are not persisted.
+- Audits the upstream npm lockfile and installed tree, both full and production-only.
+- In patched mode, runs `npm audit fix --package-lock-only --ignore-scripts --no-force`, preserves upstream manifests and Rust lockfile, records the effective lockfile and patch, and blocks the installer if any npm findings remain. Upstream mode preserves the original lockfile and reports findings.
+- Audits the entire Cargo.lock using pinned cargo-audit 0.23.0 and the current RustSec database. No automatic Rust dependency changes. An invalid or unavailable audit fails either mode; known vulnerabilities block when the Rust policy is `block`. Informational warnings are recorded.
+- Generates an npm CycloneDX inventory and Windows-filtered Cargo metadata. These are dependency inventories, not a complete SBOM of the final executable.
+- Runs TypeScript checks, an optimized Windows x64 Tauri/NSIS build and upstream Rust library regression tests. The tests include file collision and atomic output behavior in the current upstream revision.
+- Checks dependency hashes again after compilation and tests and rejects unexpected tracked source changes.
+- Extracts the NSIS installer without executing it, checks the AMD64 PE header and verifies that its embedded application executable matches the compiled application byte for byte.
+- Publishes a structured manifest, installer SHA-256 and the installed-executable SHA-256.
+- Downloads the exact installer artifact in an independent Linux job, checks its hashes and recorded build identity, and creates GitHub artifact attestations for the installer and manifest. The attestation job has scoped OIDC/attestation permissions, does not check out upstream code, and never executes the installer.
 
-## Verify and install
+The build is not an official release or Authenticode-signed installer. GitHub attestations establish provenance for this repository's build, not approval by the upstream author. A clean audit is not proof of absence of vulnerabilities. Native libraries, npm lifecycle scripts, runtime behavior and all bundled code are not exhaustively security-tested. TypeScript and Rust checks do not substitute for testing the GUI or representative image compression.
 
-Extract the artifact ZIP. In PowerShell, run `Get-FileHash -Algorithm SHA256 -LiteralPath '.\<installer filename>.exe'` (replace the placeholder with the actual filename) and compare with SHA256SUMS.txt. A matching hash verifies the downloaded bytes against the build record, not an upstream digital signature.
+## Artifacts
 
-Back up your existing Caesium settings before installing a new build. Close the application, verify the installer and source identity, and test representative copies of images after installation. Do not publish personal configuration files or image data in this repository.
+Only use an installer from a run whose **entire workflow** succeeded, including the independent attestation job. A build artifact may exist even if that final job fails. Successful build artifacts are labeled with source version, commit, mode, run ID and attempt. Diagnostics are uploaded even when earlier steps fail where possible.
 
-## Source and license
+Installer archive:
+- NSIS installer
+- `SHA256SUMS.txt`
+- `INSTALLED-EXE-SHA256.txt`
+- `build-manifest.json`
+- Final npm audits, dependency hashes, source record and upstream license
 
-Original application: [Lymphatus/caesium-v3](https://github.com/Lymphatus/caesium-v3). Each run records the actual checked-out commit and copies the upstream license. Updater-artifact generation is disabled through a local Tauri configuration override. The optional security-patched mode also modifies the npm dependency lockfile in the disposable runner checkout; changes are not pushed to upstream.
+Diagnostics archive:
+- Original/effective npm lockfiles, Rust lockfile and patch in patched mode
+- All npm and RustSec reports, audit status, dependency inventories
+- Runner/toolchain information and source identity
+- Compiler, regression test and installer extraction logs
+
+Artifacts expire after 90 days. Keep important installers and manifests locally. No automatic release publishing or installation occurs.
+
+## Verify and install on Windows
+
+Extract the downloaded installer artifact ZIP. Open PowerShell in the extracted folder:
+
+```powershell
+$M = Get-Content .\build-manifest.json -Raw | ConvertFrom-Json; $I = Join-Path (Get-Location) $M.installer.name; if ((Get-FileHash -LiteralPath $I -Algorithm SHA256).Hash -ne $M.installer.sha256) { throw 'Installer hash mismatch' }; Write-Host 'Installer hash verified'
+```
+
+Optional stronger provenance verification, if GitHub CLI is installed:
+
+```powershell
+gh attestation verify "$I" --repo kookie99/caesium-builds; if ($LASTEXITCODE -ne 0) { throw 'Installer attestation verification failed' }; gh attestation verify .\build-manifest.json --repo kookie99/caesium-builds; if ($LASTEXITCODE -ne 0) { throw 'Manifest attestation verification failed' }
+```
+
+Close Caesium, back up the active settings.json privately, and install over the existing version when appropriate. Then compare the installed executable to the manifest (default per-user install directory):
+
+```powershell
+$Exe = Join-Path $env:LOCALAPPDATA ('Caesium Image Compressor\' + $M.executable.name); if ((Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash -ne $M.executable.sha256) { throw 'Installed executable differs from build manifest' }; Write-Host 'Installed executable verified'
+```
+
+Confirm settings remain intact and test a few disposable copies of JPEG, PNG, WebP and any other important formats. Never upload personal settings or images to this public repository.
+
+## Maintenance
+
+- [Workflow validation](https://github.com/kookie99/caesium-builds/actions/workflows/validate-workflows.yml) runs actionlint when workflow files change, or manually.
+- Dependabot checks action pins weekly and proposes pull requests; review changes before merging. It does not automatically update the upstream application's dependencies.
+- The main build remains manually triggered. No recurring builds are scheduled.
+- The exact source commit, manifests, dependency lockfiles and toolchain records improve traceability; bit-for-bit reproducibility is not guaranteed because runner images, registry state, build tools and advisories can change.
+
+## License
+
+Original application: [Lymphatus/caesium-v3](https://github.com/Lymphatus/caesium-v3). The build override disables signed updater-artifact generation, not the upstream updater itself. The optional npm remediation changes only the runner checkout, not the upstream repository.
